@@ -1,0 +1,345 @@
+================================================================================
+ SPEC: Repurposing a "neonious one" (ESP32 + LAN8720) as an Ethernet->WiFi
+       NAT adapter, with OTA, a web config UI, in-RAM logging, and traffic stats
+================================================================================
+Purpose of this file
+--------------------
+This is a self-contained, reproducible specification of a reverse-engineering +
+firmware project. It is written so that another engineer OR another LLM can
+repeat the entire effort from scratch without access to this chat. It contains:
+  (1) the goal and hardware,
+  (2) every reverse-engineered hardware quirk and WHY it matters,
+  (3) the final working configuration,
+  (4) the software architecture and the non-obvious software quirks,
+  (5) the exact toolchain / build / OTA-flash procedure,
+  (6) the chronological debugging journey (so the reasoning can be re-derived),
+  (7) verification steps and pitfalls.
+
+Companion files:
+  firmware/EthToWifiBridge/EthToWifiBridge.ino  - the firmware (single sketch)
+  README.md                                     - user-facing documentation
+  (local-only, not committed: pin_mapping.txt = original partly-WRONG reverse-eng
+   notes; flash_id.txt = esptool chip/flash ID dump. Their content is summarized
+   in sections 2-3 below.)
+
+
+================================================================================
+1. GOAL
+================================================================================
+Take an old "neonious one" IoT board (which has an RJ45 Ethernet port driven by
+a LAN8720A PHY and an ESP32) and turn it into a small appliance that lets an
+ETHERNET-ONLY device reach the internet over WiFi.
+
+Topology (L3 NAT router, NOT an L2 bridge):
+
+   [ Ethernet-only device ] --RJ45--> [ neonious one / ESP32 ] ~~WiFi~~> [ Router ] -> Internet
+        192.168.5.x (DHCP)              ETH: 192.168.5.1 (gw)              STA: DHCP
+                                        WiFi STA: e.g. <board-wifi-ip>       from your LAN
+                                        NAPT translates 192.168.5.0/24 -> WiFi IP
+
+Why NAT and not a transparent bridge:
+  The ESP32 WiFi stack in STATION mode cannot transparently L2-bridge foreign
+  MAC addresses onto the WiFi link (the AP only expects the station's own MAC).
+  So we route at L3 with NAPT (the same mechanism as the ESP32 "WiFi softAP NAT"
+  examples). The Ethernet device lives on its own subnet behind the board.
+  Consequence: the device is NOT on the main LAN broadcast domain (no mDNS/SSDP
+  across the boundary without extra work).
+
+
+================================================================================
+2. HARDWARE (from flash_id.txt + reverse engineering)
+================================================================================
+Board:        neonious one (ESP32-based, integrated RJ45 magjack J1B1211CCD)
+MCU:          ESP32-D0WDQ6  revision v1.0   (Wi-Fi + BT, dual core)
+              ** rev v1.0 is the OLD silicon - its EMAC RX path is unreliable
+                 when the ESP32 GENERATES the RMII clock; an EXTERNAL clock is
+                 effectively required. This is the crux of the whole project. **
+Crystal:      40 MHz
+MAC:          xx:xx:xx:xx:xx:xx   (per-device; redacted)
+Ethernet PHY: SMSC/Microchip LAN8720A (RMII, 100/10 Mbps), 50 MHz reference clk
+Flash:        4 MB, manufacturer 0xC8 (GigaDevice), device 0x6016
+Flash voltage:1.8V, selected by a strapping pin (GPIO12 / MTDI).
+              ** Do NOT drive GPIO12; it sets flash voltage at boot. **
+
+
+================================================================================
+3. REVERSE-ENGINEERED HARDWARE QUIRKS  (the heart of this document)
+================================================================================
+The original reverse-eng notes (pin_mapping.txt) were PARTLY WRONG. Corrections
+below. Each quirk lists the SYMPTOM that exposed it.
+
+Q1. RMII reference clock = GPIO0, fed by an EXTERNAL oscillator that is gated by
+    an enable pin. The enable pin is GPIO5 (wired as the LAN8720 "PHY power"
+    line). The ESP32 must drive GPIO5 HIGH (the Arduino ETH driver does this for
+    you if you pass it as the "power" pin) and then take the clock as an INPUT
+    on GPIO0 (ETH_CLOCK_GPIO0_IN).
+      - WHY a gated external oscillator: GPIO0 is also a boot strapping pin and
+        must be HIGH at reset to boot from flash. A free-running 50 MHz clock on
+        GPIO0 during boot would break strapping, so the oscillator is held off
+        at boot (pulldown on enable) and enabled by firmware AFTER boot.
+      - SYMPTOM that revealed it: With ETH_CLOCK_GPIO0_IN and power=-1, the PHY
+        was dead (no MDIO, LEDs off). With ETH_CLOCK_GPIO0_OUT (ESP32 generates
+        the clock) the PHY powered up, LEDs lit, link negotiated at 100/full,
+        and MDIO worked -- BUT no Ethernet DATA frames passed (ping/DHCP failed).
+        That "link OK + MDIO OK + zero data" signature = RMII data path broken,
+        which on ESP32 rev v1.0 is the classic "must use external clock" issue.
+      - FIX: power pin = GPIO5, clock = ETH_CLOCK_GPIO0_IN. Then data flows.
+      - HOW GPIO5 was found: a firmware "sweep" tried ETH.begin() with
+        ETH_CLOCK_GPIO0_IN against candidate power pins {16,5,2,4,18,32,33,14,
+        15,13}; ETH.begin() returns true only if a clock appears and the PHY
+        answers on MDIO. GPIO16 = no; GPIO5 = PHY FOUND (and once GPIO5 enabled
+        the now free-running oscillator, every later pin also "found" it). The
+        first pin to flip no->FOUND is the enable: GPIO5.
+
+Q2. PHY SMI address is NOT 0 or 1. Use auto-detect: pass phy_addr = -1 so the
+    driver scans the MDIO bus. (Earlier fixed guesses of 0 and 1 both failed --
+    though those tests were also invalid because the clock was wrong at the time.)
+
+Q3. MDC (SMI clock) = GPIO1. GPIO1 is also UART0 TX (the USB serial line).
+      - CONSEQUENCE: once ETH.begin() reroutes GPIO1 to the EMAC, USB Serial
+        output stops working. There is effectively NO serial console on this
+        board once Ethernet is up. => an in-RAM web-served log is mandatory for
+        debugging (see software section).
+
+Q4. MDIO (SMI data) = GPIO23. (Non-default; many ESP32 LAN8720 examples use
+    GPIO18 for MDIO. This board uses 23.)
+
+Q5. RMII DATA pins are the ESP32's fixed EMAC IO_MUX pins and cannot be moved:
+        TXD0=GPIO19, TX_EN=GPIO21, TXD1=GPIO22, RXD0=GPIO25, RXD1=GPIO26,
+        CRS_DV=GPIO27.
+    (These are hardwired in the ESP32 EMAC; the board must route the PHY to
+     exactly these, which it does. Not configurable in software.)
+
+Q6. Flash voltage 1.8V is set by GPIO12 strapping. Leave GPIO12 alone.
+
+FINAL CORRECT PIN MAP
+---------------------
+   Function            ESP32 GPIO      Notes
+   RMII REF_CLK        GPIO0  (IN)     external 50 MHz osc, gated by GPIO5
+   Oscillator enable   GPIO5           ETH "power" pin, driver drives it HIGH
+   MDC                 GPIO1           also UART0 TX -> serial console dies
+   MDIO                GPIO23
+   TXD0                GPIO19          fixed EMAC pin
+   TX_EN               GPIO21          fixed EMAC pin
+   TXD1                GPIO22          fixed EMAC pin
+   RXD0                GPIO25          fixed EMAC pin
+   RXD1                GPIO26          fixed EMAC pin
+   CRS_DV              GPIO27          fixed EMAC pin
+   PHY SMI address     auto (-1)
+   (flash voltage)     GPIO12          strap = 1.8V, do not touch
+
+Arduino ETH.begin() call that encodes all of this:
+   ETH.begin(ETH_PHY_LAN8720, /*addr*/-1, /*MDC*/1, /*MDIO*/23,
+             /*power*/5, ETH_CLOCK_GPIO0_IN);
+
+
+================================================================================
+4. SOFTWARE ARCHITECTURE
+================================================================================
+Single Arduino sketch (EthToWifiBridge/EthToWifiBridge.ino). Responsibilities:
+
+  - WiFi STA: join the upstream WiFi (credentials in NVS, defaults compiled in).
+  - Ethernet: bring up LAN8720 with the corrected pin/clock config.
+  - Router: ETH netif gets a static IP (192.168.5.1/24, the gateway); a DHCP
+    server runs on the ETH side; NAPT translates ETH traffic out over WiFi.
+  - Config persistence: Preferences/NVS (namespace "ethwifi"). Web UI edits
+    WiFi creds, ETH gateway/mask, DHCP range, OTA host/password.
+  - OTA: ArduinoOTA, password "admin", host "neonious-eth-wifi".
+  - Web UI (HTTP :80, HTTP Basic auth user "admin" / pass = OTA password):
+        /            settings form + live status + live traffic card
+        /log         dark auto-refreshing log viewer
+        /log.txt     raw log text
+        /stats.json  live traffic counters (JSON)
+        /scan        WiFi scan (JSON) for the SSID picker
+        /save        persist settings + reboot (POST)
+        /reset       erase NVS + reboot to defaults (POST)
+  - Logging: in-RAM ring buffer (50 lines), mutex-protected, served on the web
+    (because USB serial is dead, see Q3).
+  - Setup/recovery: WiFi creds are NOT compiled in (blank defaults). With no
+    creds, or if WiFi fails to join within 20 s, start a SoftAP "neonious-setup"
+    (pass "neonious", http://192.168.4.1) so OTA/web still work and you can
+    enter/fix credentials. AP_STA mode so scanning still works.
+  - Traffic stats: RX/TX bytes + packets by wrapping the ETH netif's input/
+    linkoutput function pointers.
+
+
+================================================================================
+5. NON-OBVIOUS SOFTWARE QUIRKS (each one cost a debugging cycle)
+================================================================================
+S1. The esp_netif ETHERNET interface is created as a DHCP *client* and has NO
+    DHCP *server* instance. esp_netif_dhcps_start() therefore FAILS on it
+    (ESP_ERR_ESP_NETIF_DHCPS_START_FAILED; setting options returns
+    ESP_ERR_ESP_NETIF_IF_NOT_READY).
+      FIX: run the low-level lwIP DHCP server directly on the ETH lwIP netif:
+        struct netif *n = (struct netif *)esp_netif_get_netif_impl(eth_netif);
+        dhcps_t *d = dhcps_new();
+        dhcps_set_option_info(d, REQUESTED_IP_ADDRESS, &lease, sizeof(lease));
+        dhcps_set_option_info(d, IP_ADDRESS_LEASE_TIME, &mins, sizeof(mins));
+        dhcps_set_option_info(d, DOMAIN_NAME_SERVER, &offerDnsFlag, 1); // 0x02
+        dhcps_start(d, n, server_ip);
+        dhcps_dns_setserver(d, &dns);            // after start
+      Headers: "dhcpserver/dhcpserver.h", "dhcpserver/dhcpserver_options.h",
+               "esp_netif_net_stack.h".
+
+S2. lwIP dhcps_* are NOT thread-safe. Calling dhcps_start() from the Arduino
+    network-event task or loop() task corrupts lwIP and PANICS the board, which
+    then reboot-loops (it boots, joins WiFi, ETH links, crashes on the dhcps
+    call, repeats every ~6 s).
+      FIX: marshal all dhcps_* calls into the TCP/IP thread with
+        esp_netif_tcpip_exec(callback, ctx);
+      RECOVERY from the resulting reboot-loop (important!): the crash only fires
+      when the ETH link comes up. UNPLUG the Ethernet cable -> ETH never links ->
+      no crash -> board stays on WiFi -> OTA the fixed firmware. (This is why the
+      sketch brings OTA + web up BEFORE Ethernet in setup().)
+
+S3. The lwIP DHCP server silently rejects any address pool LARGER than
+    DHCPS_MAX_LEASE (=100 addresses) and falls back to its default pool
+    (server_ip + 1, e.g. .2). Example bug: range 192.168.5.100-200 is 101
+    addresses -> rejected -> clients got .2 instead of .100.
+      FIX: keep the range <= 100 addresses (default 192.168.5.100-199 = exactly
+      100) and clamp any user-entered range to 100.
+
+S4. DNS: two separate gotchas.
+    (a) The DHCP server only hands out the configured DNS if the OFFER_DNS flag
+        (0x02) is set via dhcps_set_option_info(..., DOMAIN_NAME_SERVER, ...).
+        Without it, lwIP hands out the SERVER's OWN IP (192.168.5.1) as the DNS.
+        Since this box runs no DNS forwarder, clients then can't resolve names.
+        BOTH a primary and secondary DNS can be offered: set them with
+        dhcps_dns_setserver_by_type(d, &ip, DNS_TYPE_MAIN/DNS_TYPE_BACKUP). The
+        IDF v5.5 dhcpserver appends the backup to DHCP option 6 if it is set
+        (dynamic option length), so clients receive both (e.g. 8.8.8.8 + 8.8.4.4).
+    (b) Bringing the ETH interface UP WIPES lwIP's GLOBAL DNS servers (DNS is
+        global in lwIP; ETH coming up as a DHCP client clears them and, because
+        the ETH side never gets an upstream lease, they stay 0). So by the time
+        the router starts, WiFi.dnsIP() reads 0.
+      FIX: cache WiFi.dnsIP() at WiFi-connect time (while still valid) and hand
+      out that cached value. A loop() retry re-applies once DNS is available.
+
+S5. NAPT: esp_netif_napt_enable(eth_netif) works on Arduino-ESP32 core 3.x
+    (lwIP NAPT + IP_FORWARD are compiled in). Enable it on the ETH (inside)
+    netif. Also call esp_netif_set_default_netif(sta_netif) so the default route
+    is WiFi.
+
+S6. No per-interface byte counters: lwIP MIB2_STATS is 0 in this build, so
+    netif->mib2_counters does not exist. Count traffic by wrapping the ETH
+    netif's ->input (RX) and ->linkoutput (TX) function pointers once.
+
+S7. Serial console is gone after ETH.begin() (Q3). All diagnostics go to the
+    in-RAM web log. Add log lines liberally; you cannot printf-debug otherwise.
+
+
+================================================================================
+6. TOOLCHAIN / BUILD / FLASH  (exact, reproducible)
+================================================================================
+Host: Windows 11. Tools used:
+  - arduino-cli 1.5.1            (winget: "winget install ArduinoSA.CLI";
+                                   installs to "C:\Program Files\Arduino CLI\")
+  - Arduino-ESP32 core 3.3.10    (esp32:esp32) -- already present via Arduino IDE
+  - python + esptool v5.3.0      (python -m esptool ...)
+  - espota.py  (ships with the core):
+      <Arduino15>\packages\esp32\hardware\esp32\3.3.10\tools\espota.py
+
+Board / FQBN:  esp32:esp32:esp32   ("ESP32 Dev Module", default 4MB partition
+               scheme -- has dual OTA app partitions, ~1.31 MB each; sketch ~82%).
+
+Compile:
+  arduino-cli compile --fqbn esp32:esp32:esp32 \
+      --output-dir build  EthToWifiBridge
+
+OTA flash (board already runs an OTA-capable firmware; pwd "admin"):
+  python <path>\espota.py -i <BOARD_IP> -p 3232 -a admin \
+      -f build\EthToWifiBridge.ino.bin -r
+  (ArduinoOTA listens on UDP 3232; a TCP probe of 3232 will show "closed" --
+   that is normal.)
+
+First-ever flash / serial flash (if no OTA yet): use esptool over USB (COM
+port). Note GPIO1=MDC means USB serial monitor won't show runtime logs; use the
+web log instead.
+
+Find the board IP: it should appear on your LAN via DHCP; or check the router.
+mDNS may not advertise. In this project the board was at <board-wifi-ip>.
+
+
+================================================================================
+7. CHRONOLOGICAL DEBUGGING JOURNEY (so the reasoning can be re-derived)
+================================================================================
+1.  Wrote initial sketch from pin_mapping.txt: clock=GPIO0_IN, power=-1,
+    PHY addr=0. Added WiFi STA + DHCP server + NAPT + ArduinoOTA.
+2.  Added NVS config + web UI; added WiFi scan, editable mask/DHCP range, reset.
+3.  Added in-RAM web log (anticipating Q3: no serial).
+4.  OTA-flashed. Board joined WiFi fine. Ethernet: no link.
+5.  Tried PHY addr 0 -> 1: still no link. (Both invalid - clock was wrong.)
+6.  User: LEDs off, chip is SMSC LAN8720A. Reasoned LEDs off = PHY unclocked.
+    pin_mapping said GPIO0 -> LAN8720 pin5 (CLKIN), so ESP32 must SUPPLY clock:
+    switched ETH_CLOCK_GPIO0_IN -> GPIO0_OUT.  => PHY alive, LEDs on, link
+    100/full, MDIO OK. (Quirk Q1 first half.)
+7.  But: ping (even to 192.168.5.1) and DHCP failed. "link OK, MDIO OK, no data"
+    => RMII data path dead. Added ETH.begin() return + per-step esp_netif return
+    logging.
+8.  Logs showed dhcps_start -> ESP_ERR_DHCPS_START_FAILED (Quirk S1). Switched
+    to low-level lwIP dhcps on the ETH netif.
+9.  That CRASHED the board into a reboot-loop (Quirk S2: dhcps not thread-safe).
+    Recovered by unplugging the cable (no link -> no crash) and OTA'ing a fix
+    that wraps dhcps in esp_netif_tcpip_exec().
+10. dhcps_start now OK, but client still got no IPv4. Static IP on the laptop +
+    ping ALL failed => confirmed the data path itself was dead (not just DHCP).
+11. Web search confirmed the canonical ESP32+LAN8720 design: external 50 MHz
+    oscillator with an ENABLE pin (often GPIO17), clock as GPIO0_IN. Tried
+    power=GPIO17 + GPIO0_IN => PHY not found (wrong pin).
+12. Wrote an in-firmware sweep over candidate power pins with GPIO0_IN. Found
+    GPIO5 = the oscillator enable (Quirk Q1 second half + Q2 auto-addr).
+13. Set power=GPIO5, clock=GPIO0_IN, addr=-1 => PHY found on a clean external
+    clock, link stable, AND a DHCP lease was granted => RMII data now works.
+14. DNS broken: clients got DNS=192.168.5.1. Found OFFER_DNS flag missing
+    (S4a) AND that ETH-up wipes global DNS (S4b). Cached WiFi DNS at connect.
+15. DHCP range ignored (lease .2): found DHCPS_MAX_LEASE=100 cap (S3); changed
+    default to .100-.199 and clamp oversized ranges.
+16. Cleanup: removed the sweep diagnostic; added traffic counters via netif
+    input/linkoutput wrapping (S6). Final verify: DNS=8.8.8.8 offered, lease
+    .100, NAPT on, traffic counted, internet works.
+
+
+================================================================================
+8. FINAL WORKING CONFIGURATION (copy these exactly)
+================================================================================
+ETH.begin(ETH_PHY_LAN8720, -1, /*MDC*/1, /*MDIO*/23, /*power*/5,
+          ETH_CLOCK_GPIO0_IN);
+ETH gateway/subnet : 192.168.5.1 / 255.255.255.0
+DHCP pool          : 192.168.5.100 - 192.168.5.199  (<=100 addresses)
+DHCP DNS offered   : both DNS the ESP32 got from WiFi (main+backup, cached),
+                     OFFER_DNS flag set
+Stats (/stats.json): link/speed/duplex, RX+TX bytes & packets, uptime, NTP
+                     wall-clock boot/now, DHCP client count + last lease, RSSI,
+                     SSID, WiFi IP, LAN gateway, free heap, firmware build
+NAPT               : enabled on ETH netif; default netif = WiFi STA
+OTA                : host "neonious-eth-wifi", password "admin", UDP 3232
+Web UI             : http://<wifi-ip>/  (admin / <ota password>)
+Setup/recovery AP  : "neonious-setup" / "neonious" at http://192.168.4.1
+                     (shown on first boot; WiFi creds entered via the web UI)
+
+
+================================================================================
+9. VERIFICATION CHECKLIST
+================================================================================
+[ ] Web log shows: ETH.begin()=OK, "clk GPIO0_IN", link UP 100/full.
+[ ] Web log shows: "offering upstream DNS <x>" (NOT the gateway IP).
+[ ] Web log shows: "dhcp pool 192.168.5.100 - 192.168.5.199".
+[ ] Web log shows: "DHCP lease: 192.168.5.100 -> <client MAC>".
+[ ] Client (DHCP) gets 192.168.5.100, gw/dns set; pings 192.168.5.1,
+    8.8.8.8, and resolves google.com.
+[ ] /stats.json shows rx/tx climbing under load.
+[ ] Board reachable for OTA after reboot (no crash loop).
+
+
+================================================================================
+10. PITFALLS / WARNINGS
+================================================================================
+- If the cable is plugged and a NEW firmware crashes on ETH link-up, the board
+  reboot-loops and the OTA window is ~1 s. UNPLUG THE CABLE to recover, then OTA.
+- Wrong WiFi credentials => board drops to the recovery AP and leaves your LAN.
+  Set creds before flashing, or use the recovery AP to fix them.
+- Do not exceed 100 addresses in the DHCP range (DHCPS_MAX_LEASE).
+- Do not drive GPIO12 (flash voltage strap) or rely on USB serial after ETH up.
+- This is ESP32 rev v1.0: the external clock (GPIO0_IN + GPIO5 enable) is
+  required; ESP32-generated clock (GPIO0_OUT) will link but not pass data.
+================================================================================

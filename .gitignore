@@ -1,0 +1,15 @@
+# Local-only working files (device dumps, scratch reverse-eng notes, flash
+# images that may contain NVS secrets) — never committed.
+local/
+
+# Build output (arduino-cli --output-dir build)
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Editor / OS cruft
+.vscode/
+.DS_Store
+Thumbs.db
