@@ -197,6 +197,42 @@ Link speed/duplex, RX/TX bytes & packets, uptime, NTP wall-clock boot &
 current time, DHCP client count + last lease, WiFi RSSI/SSID/IP, LAN gateway,
 free heap, and firmware build timestamp.
 
+### Example boot log
+A healthy startup looks like this (from `/log.txt`; addresses/SSID redacted):
+
+```text
+[00:00:00] boot: neonious Ethernet -> WiFi adapter
+[00:00:00] boot tap 1/3 - tap RESET again within 8s to factory-reset
+[00:00:00] config loaded, target SSID 'YourWiFi'
+[00:00:00] WiFi: connecting to 'YourWiFi'...
+[00:00:00] WiFi: associated to AP
+[00:00:01] WiFi: got IP 192.168.1.50
+[00:00:01] WiFi: connected, IP 192.168.1.50
+[00:00:01] WiFi: gw 192.168.1.1, dns 8.8.8.8 / 8.8.4.4
+[00:00:01] OTA ready: host 'neonious-eth-wifi'
+[00:00:01] ETH: starting LAN8720 (PHY addr -1, clk GPIO0_IN, MDC=1 MDIO=23)...
+[00:00:03] ETH: interface started
+[00:00:03] ETH: link up
+[00:00:03] router: set_ip 192.168.5.1 -> ESP_OK
+[00:00:03] router: dhcp pool 192.168.5.100 - 192.168.5.199
+[00:00:03] router: offering upstream DNS 8.8.8.8 + 8.8.4.4 to clients
+[00:00:03] router: dhcps_start -> ESP_OK
+[00:00:03] router: napt_enable -> ESP_OK
+[00:00:03] ETH.begin() = OK (PHY found on MDIO)
+[00:00:03] router: set_ip 192.168.5.1 -> ESP_OK
+[00:00:03] router: dhcp pool 192.168.5.100 - 192.168.5.199
+[00:00:03] router: offering upstream DNS 8.8.8.8 + 8.8.4.4 to clients
+[00:00:03] router: dhcps_start -> ESP_OK
+[00:00:03] router: napt_enable -> ESP_OK
+[00:00:03] ETH: link UP (100 Mbps, full)
+[00:00:08] reset-tap counter cleared (normal uptime reached)
+```
+
+The `router:` block appears twice because `startEthRouter()` runs once from the
+`ETH_CONNECTED` event and once from `setup()` after `ETH.begin()` returns with
+the link already up — both are idempotent. The two `ETH: link …` lines are the
+event-driven and polled link-up reports (the polled one adds speed/duplex).
+
 ### Setup / recovery AP
 With no WiFi configured, or if the saved WiFi can't be joined within 20 s, the
 board starts an access point **`neonious-setup`** (password `neonious`) at
