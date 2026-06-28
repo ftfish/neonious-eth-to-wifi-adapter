@@ -159,6 +159,13 @@ Single Arduino sketch (EthToWifiBridge/EthToWifiBridge.ino). Responsibilities:
     creds, or if WiFi fails to join within 20 s, start a SoftAP "neonious-setup"
     (pass "neonious", http://192.168.4.1) so OTA/web still work and you can
     enter/fix credentials. AP_STA mode so scanning still works.
+  - Factory reset, out-of-band: tapping the on-board RESET button 3x in quick
+    succession erases NVS and reboots to defaults (-> setup AP). A boot counter
+    in a separate NVS namespace ("resetdet") is incremented very early in setup()
+    (before loadConfig) and auto-cleared from loop() once uptime passes ~8 s, so
+    only rapid taps count. This is the escape hatch for WiFis with client
+    isolation, where the web UI /reset is unreachable over the air. (The wired
+    side is independent: http://192.168.5.1/ from an RJ45 client also works.)
   - Traffic stats: RX/TX bytes + packets by wrapping the ETH netif's input/
     linkoutput function pointers.
 

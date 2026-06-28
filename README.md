@@ -44,6 +44,8 @@ WiFi. The device lives on its own subnet (`192.168.5.0/24` by default).
 - **In-RAM web log** (the USB serial console is unavailable — see quirks)
 - **Live traffic statistics** (RX/TX bytes & packets, uptime, clients, RSSI, …)
 - **Recovery AP** so you're never locked out if WiFi credentials are wrong
+- **Triple-tap RESET → factory reset** out-of-band escape hatch (works even when
+  WiFi client isolation blocks the web UI)
 
 ---
 
@@ -201,6 +203,20 @@ board starts an access point **`neonious-setup`** (password `neonious`) at
 **`http://192.168.4.1`** so you can enter/fix the configuration or OTA a new
 build.
 
+### Factory reset (triple-tap RESET)
+If you can't reach the web UI over WiFi — e.g. the network uses **client
+isolation**, so devices on it can't talk to the board — you can still wipe all
+settings using only the on-board **RESET** button:
+
+> **Press RESET 3 times in a row**, pausing ~1–2 s between taps (let the board
+> begin booting each time, but tap again within ~8 s). On the third boot the
+> board erases all saved settings and comes up as the `neonious-setup` AP.
+
+A boot counter in NVS tracks the taps; it auto-clears after the board has been
+up for ~8 s, so a normal power-cycle or single reset never triggers it. (You can
+also always reach `http://192.168.5.1/` from a device plugged into the RJ45 — the
+wired side is unaffected by WiFi client isolation.)
+
 ---
 
 ## Troubleshooting
@@ -213,6 +229,7 @@ build.
 | Client gets `192.168.5.2` not `.100` | DHCP range > 100 addresses; keep it ≤ 100 (lwIP `DHCPS_MAX_LEASE`) |
 | Client DNS = `192.168.5.1`, can't resolve | Old lease; renew DHCP on the client (`ipconfig /release && /renew`) |
 | Board reboot-loops after a bad flash | **Unplug the Ethernet cable** (no link → no crash), then OTA a fix |
+| Can't reach web UI over WiFi (client isolation) | **Triple-tap RESET** to factory reset, or browse `http://192.168.5.1/` from a device on the RJ45 |
 | No serial output | Expected — MDC is on GPIO1/TX; use `/log` |
 
 ---

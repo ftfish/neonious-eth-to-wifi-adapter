@@ -84,6 +84,16 @@
 #define RECOVERY_AP_PASS  "neonious"          // >= 8 chars; change me
 #define WIFI_CONNECT_TIMEOUT_MS  20000
 
+// Multi-reset factory wipe: tapping the on-board RESET button this many times in
+// quick succession erases all settings and reboots to defaults (-> setup AP).
+// This is the out-of-band escape hatch for WiFis with client isolation, where
+// the web UI / /reset can't be reached over the air. A boot counter is kept in
+// NVS (survives both the RESET button and a power cycle); it auto-clears once
+// the board has been up past RESET_TAP_WINDOW_MS, so only *rapid* taps count.
+#define RESET_TAP_COUNT      3
+#define RESET_TAP_WINDOW_MS  8000
+#define RESET_DET_NS         "resetdet"      // NVS namespace for the tap counter
+
 // --------------------------- ETHERNET / PHY PINS ---------------------------
 #define ETH_PHY_TYPE_   ETH_PHY_LAN8720
 #define ETH_PHY_ADDR_   -1                 // -1 = auto-detect: driver scans the
@@ -755,6 +765,47 @@ static void startSetupAp(const char *reason) {
   setupWeb();
 }
 
+// Count this boot toward the "tap RESET N times to factory-reset" gesture, and
+// wipe settings if the threshold is reached. Runs very early in setup() (before
+// loadConfig) so a triggered reset takes effect on this same boot. The counter
+// is cleared again from loop() once the board has run past RESET_TAP_WINDOW_MS.
+static bool checkMultiResetFactory() {
+  Preferences rd;
+  rd.begin(RESET_DET_NS, /*readOnly=*/false);
+  uint32_t taps = rd.getUInt("cnt", 0) + 1;
+
+  if (taps >= RESET_TAP_COUNT) {
+    rd.putUInt("cnt", 0);
+    rd.end();
+    logf("RESET tapped %ux -> FACTORY RESET (erasing settings)", (unsigned)taps);
+    g_prefs.begin(PREFS_NS, /*readOnly=*/false);
+    g_prefs.clear();
+    g_prefs.end();
+    return true;
+  }
+
+  rd.putUInt("cnt", taps);
+  rd.end();
+  logf("boot tap %u/%u - tap RESET again within %us to factory-reset",
+       (unsigned)taps, (unsigned)RESET_TAP_COUNT, (unsigned)(RESET_TAP_WINDOW_MS / 1000));
+  return false;
+}
+
+// Clear the multi-reset tap counter after the board has stayed up long enough
+// that this is clearly a normal boot, not part of a rapid reset sequence.
+static void clearResetTapCounterOnce() {
+  static bool done = false;
+  if (done || millis() < RESET_TAP_WINDOW_MS) return;
+  done = true;
+  Preferences rd;
+  rd.begin(RESET_DET_NS, /*readOnly=*/false);
+  if (rd.getUInt("cnt", 0) != 0) {
+    rd.putUInt("cnt", 0);
+    logf("reset-tap counter cleared (normal uptime reached)");
+  }
+  rd.end();
+}
+
 // --------------------------------- SETUP -----------------------------------
 void setup() {
   // Serial output dies after ETH.begin() (GPIO1 = MDC), but boot banner is fine.
@@ -762,6 +813,9 @@ void setup() {
 
   g_logMutex = xSemaphoreCreateMutex();
   logf("boot: neonious Ethernet -> WiFi adapter");
+
+  // Out-of-band recovery: N rapid RESET taps wipe settings before we load them.
+  checkMultiResetFactory();
 
   loadConfig();
   logf("config loaded, target SSID '%s'", g_cfg.wifiSsid.c_str());
@@ -831,6 +885,10 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   g_web.handleClient();
+
+  // Once we've been up a while, this boot wasn't part of a rapid RESET-tap
+  // sequence, so reset the factory-wipe tap counter.
+  clearResetTapCounterOnce();
 
   // Belt-and-suspenders: if events were missed, start the router once ready.
   if (!g_recoveryMode && !g_ethRouterStarted &&
